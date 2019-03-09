@@ -51,6 +51,13 @@ static inline struct dentry *vfsub_lkup_one(struct qstr *name,
 
 /* ---------------------------------------------------------------------- */
 
+int vfsub_create(struct inode *dir, struct path *path, int mode,
+		 bool want_excl);
+int vfsub_link(struct dentry *src_dentry, struct inode *dir,
+	       struct path *path, struct inode **delegated_inode);
+
+/* ---------------------------------------------------------------------- */
+
 static inline loff_t vfsub_f_size_read(struct file *file)
 {
 	return i_size_read(file_inode(file));
