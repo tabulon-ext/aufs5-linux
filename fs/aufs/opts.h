@@ -26,17 +26,28 @@ struct file;
 #define AuOpt_UDBA_REVAL	(1 << 3)
 #define AuOpt_UDBA_HNOTIFY	(1 << 4)
 #define AuOpt_PLINK		(1 << 6)	/* pseudo-link */
+#define AuOpt_DIRPERM1		(1 << 7)	/* ignore the lower dir's perm
+						   bits */
+#define AuOpt_SUM		(1 << 10)	/* summation for statfs(2) */
+#define AuOpt_SUM_W		(1 << 11)	/* unimplemented */
 #define AuOpt_VERBOSE		(1 << 13)	/* print the cause of error */
 #define AuOpt_DIO		(1 << 14)	/* direct io */
+#define AuOpt_DIRREN		(1 << 15)	/* directory rename */
 
 #ifndef CONFIG_AUFS_HNOTIFY
 #undef AuOpt_UDBA_HNOTIFY
 #define AuOpt_UDBA_HNOTIFY	0
 #endif
+#ifndef CONFIG_AUFS_DIRREN
+#undef AuOpt_DIRREN
+#define AuOpt_DIRREN		0
+#endif
 
 #define AuOpt_Def	(AuOpt_XINO \
 			 | AuOpt_UDBA_REVAL \
-			 | AuOpt_PLINK)
+			 | AuOpt_PLINK \
+			 /* | AuOpt_DIRPERM1 */ \
+			)
 #define AuOptMask_UDBA	(AuOpt_UDBA_NONE \
 			 | AuOpt_UDBA_REVAL \
 			 | AuOpt_UDBA_HNOTIFY)
@@ -105,6 +116,12 @@ struct au_opt_del {
 	struct path	h_path;
 };
 
+struct au_opt_mod {
+	char		*path;
+	int		perm;
+	struct dentry	*h_root;
+};
+
 struct au_opt_xino {
 	char		*path;
 	struct file	*file;
@@ -127,6 +144,8 @@ struct au_opt {
 		struct au_opt_xino_itrunc xino_itrunc;
 		struct au_opt_add	add;
 		struct au_opt_del	del;
+		struct au_opt_mod	mod;
+		int			dirwh;
 		int			rdcache;
 		unsigned int		rdblk;
 		unsigned int		rdhash;
