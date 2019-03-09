@@ -16,9 +16,9 @@
 
 enum {
 	Opt_br,
-	Opt_add, Opt_del, Opt_append, Opt_prepend,
-	Opt_idel,
-	Opt_rdcache, Opt_rdblk, Opt_rdhash,
+	Opt_add, Opt_del, Opt_mod, Opt_append, Opt_prepend,
+	Opt_idel, Opt_imod,
+	Opt_dirwh, Opt_rdcache, Opt_rdblk, Opt_rdhash,
 	Opt_rdblk_def, Opt_rdhash_def,
 	Opt_xino, Opt_noxino,
 	Opt_trunc_xino, Opt_trunc_xino_v, Opt_notrunc_xino,
@@ -29,6 +29,8 @@ enum {
 	Opt_dio, Opt_nodio,
 	Opt_wbr_copyup, Opt_wbr_create,
 	Opt_verbose, Opt_noverbose,
+	Opt_sum, Opt_nosum, Opt_wsum,
+	Opt_dirperm1, Opt_nodirperm1,
 	Opt_acl, Opt_noacl,
 	Opt_tail, Opt_ignore, Opt_ignore_silent, Opt_err
 };
@@ -49,6 +51,11 @@ static match_table_t options = {
 	{Opt_del, "del=%s"},
 	{Opt_del, "del:%s"},
 	/* {Opt_idel, "idel:%d"}, */
+	{Opt_mod, "mod=%s"},
+	{Opt_mod, "mod:%s"},
+	/* {Opt_imod, "imod:%d:%s"}, */
+
+	{Opt_dirwh, "dirwh=%d"},
 
 	{Opt_xino, "xino=%s"},
 	{Opt_noxino, "noxino"},
@@ -78,12 +85,19 @@ static match_table_t options = {
 	{Opt_dio, "dio"},
 	{Opt_nodio, "nodio"},
 
+	{Opt_dirperm1, "dirperm1"},
+	{Opt_nodirperm1, "nodirperm1"},
+
 	{Opt_verbose, "verbose"},
 	{Opt_verbose, "v"},
 	{Opt_noverbose, "noverbose"},
 	{Opt_noverbose, "quiet"},
 	{Opt_noverbose, "q"},
 	{Opt_noverbose, "silent"},
+
+	{Opt_sum, "sum"},
+	{Opt_nosum, "nosum"},
+	{Opt_wsum, "wsum"},
 
 	{Opt_rdcache, "rdcache=%d"},
 	{Opt_rdblk, "rdblk=%d"},
@@ -471,6 +485,7 @@ static void dump_opts(struct au_opts *opts)
 	union {
 		struct au_opt_add *add;
 		struct au_opt_del *del;
+		struct au_opt_mod *mod;
 		struct au_opt_xino *xino;
 		struct au_opt_xino_itrunc *xino_itrunc;
 		struct au_opt_wbr_create *create;
@@ -492,6 +507,12 @@ static void dump_opts(struct au_opts *opts)
 			AuDbg("del {%s, %p}\n",
 			      u.del->pathname, u.del->h_path.dentry);
 			break;
+		case Opt_mod:
+		case Opt_imod:
+			u.mod = &opt->mod;
+			AuDbg("mod {%s, 0x%x, %p}\n",
+				  u.mod->path, u.mod->perm, u.mod->h_root);
+			break;
 		case Opt_append:
 			u.add = &opt->add;
 			AuDbg("append {b%d, %s, 0x%x, %p}\n",
@@ -503,6 +524,9 @@ static void dump_opts(struct au_opts *opts)
 			AuDbg("prepend {b%d, %s, 0x%x, %p}\n",
 				  u.add->bindex, u.add->pathname, u.add->perm,
 				  u.add->path.dentry);
+			break;
+		case Opt_dirwh:
+			AuDbg("dirwh %d\n", opt->dirwh);
 			break;
 		case Opt_rdcache:
 			AuDbg("rdcache %d\n", opt->rdcache);
@@ -543,6 +567,12 @@ static void dump_opts(struct au_opts *opts)
 		case Opt_notrunc_xib:
 			AuLabel(notrunc_xib);
 			break;
+		case Opt_dirperm1:
+			AuLabel(dirperm1);
+			break;
+		case Opt_nodirperm1:
+			AuLabel(nodirperm1);
+			break;
 		case Opt_plink:
 			AuLabel(plink);
 			break;
@@ -567,6 +597,15 @@ static void dump_opts(struct au_opts *opts)
 			break;
 		case Opt_noverbose:
 			AuLabel(noverbose);
+			break;
+		case Opt_sum:
+			AuLabel(sum);
+			break;
+		case Opt_nosum:
+			AuLabel(nosum);
+			break;
+		case Opt_wsum:
+			AuLabel(wsum);
 			break;
 		case Opt_wbr_create:
 			u.create = &opt->wbr_create;
@@ -624,6 +663,10 @@ void au_opts_free(struct au_opts *opts)
 		case Opt_del:
 		case Opt_idel:
 			path_put(&opt->del.h_path);
+			break;
+		case Opt_mod:
+		case Opt_imod:
+			dput(opt->mod.h_root);
 			break;
 		case Opt_xino:
 			fput(opt->xino.file);
@@ -701,6 +744,64 @@ static int au_opts_parse_idel(struct super_block *sb, aufs_bindex_t bindex,
 	err = 0;
 	del->h_path.dentry = dget(au_h_dptr(root, bindex));
 	del->h_path.mnt = mntget(au_sbr_mnt(sb, bindex));
+
+out:
+	aufs_read_unlock(root, !AuLock_IR);
+	return err;
+}
+#endif
+
+static int noinline_for_stack
+au_opts_parse_mod(struct au_opt_mod *mod, substring_t args[])
+{
+	int err;
+	struct path path;
+	char *p;
+
+	err = -EINVAL;
+	mod->path = args[0].from;
+	p = strchr(mod->path, '=');
+	if (unlikely(!p)) {
+		pr_err("no permission %s\n", args[0].from);
+		goto out;
+	}
+
+	*p++ = 0;
+	err = vfsub_kern_path(mod->path, lkup_dirflags, &path);
+	if (unlikely(err)) {
+		pr_err("lookup failed %s (%d)\n", mod->path, err);
+		goto out;
+	}
+
+	mod->perm = br_perm_val(p);
+	AuDbg("mod path %s, perm 0x%x, %s\n", mod->path, mod->perm, p);
+	mod->h_root = dget(path.dentry);
+	path_put(&path);
+
+out:
+	return err;
+}
+
+#if 0 /* reserved for future use */
+static int au_opts_parse_imod(struct super_block *sb, aufs_bindex_t bindex,
+			      struct au_opt_mod *mod, substring_t args[])
+{
+	int err;
+	struct dentry *root;
+
+	err = -EINVAL;
+	root = sb->s_root;
+	aufs_read_lock(root, AuLock_FLUSH);
+	if (bindex < 0 || au_sbbot(sb) < bindex) {
+		pr_err("out of bounds, %d\n", bindex);
+		goto out;
+	}
+
+	err = 0;
+	mod->perm = br_perm_val(args[1].from);
+	AuDbg("mod path %s, perm 0x%x, %s\n",
+	      mod->path, mod->perm, args[1].from);
+	mod->h_root = dget(au_h_dptr(root, bindex));
 
 out:
 	aufs_read_unlock(root, !AuLock_IR);
@@ -860,6 +961,23 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 				opt->type = token;
 			break;
 #endif
+		case Opt_mod:
+			err = au_opts_parse_mod(&opt->mod, a->args);
+			if (!err)
+				opt->type = token;
+			break;
+#ifdef IMOD /* reserved for future use */
+		case Opt_imod:
+			u.mod->path = "(indexed)";
+			if (unlikely(match_int(&a->args[0], &n))) {
+				pr_err("bad integer in %s\n", opt_str);
+				break;
+			}
+			err = au_opts_parse_imod(sb, n, &opt->mod, a->args);
+			if (!err)
+				opt->type = token;
+			break;
+#endif
 		case Opt_xino:
 			err = au_opts_parse_xino(sb, &opt->xino, a->args);
 			if (!err)
@@ -887,6 +1005,13 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 				break;
 			}
 			aufs_read_unlock(root, !AuLock_IR);
+			err = 0;
+			opt->type = token;
+			break;
+
+		case Opt_dirwh:
+			if (unlikely(match_int(&a->args[0], &opt->dirwh)))
+				break;
 			err = 0;
 			opt->type = token;
 			break;
@@ -939,6 +1064,8 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 		case Opt_noxino:
 		case Opt_trunc_xib:
 		case Opt_notrunc_xib:
+		case Opt_dirperm1:
+		case Opt_nodirperm1:
 		case Opt_plink:
 		case Opt_noplink:
 		case Opt_list_plink:
@@ -946,6 +1073,9 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 		case Opt_nodio:
 		case Opt_verbose:
 		case Opt_noverbose:
+		case Opt_sum:
+		case Opt_nosum:
+		case Opt_wsum:
 		case Opt_rdblk_def:
 		case Opt_rdhash_def:
 		case Opt_acl:
@@ -1107,12 +1237,27 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 		au_opt_clr(sbinfo->si_mntflags, VERBOSE);
 		break;
 
+	case Opt_sum:
+		au_opt_set(sbinfo->si_mntflags, SUM);
+		break;
+	case Opt_wsum:
+		au_opt_clr(sbinfo->si_mntflags, SUM);
+		au_opt_set(sbinfo->si_mntflags, SUM_W);
+	case Opt_nosum:
+		au_opt_clr(sbinfo->si_mntflags, SUM);
+		au_opt_clr(sbinfo->si_mntflags, SUM_W);
+		break;
+
 	case Opt_wbr_create:
 		err = au_opt_wbr_create(sb, &opt->wbr_create);
 		break;
 	case Opt_wbr_copyup:
 		sbinfo->si_wbr_copyup = opt->wbr_copyup;
 		sbinfo->si_wbr_copyup_ops = au_wbr_copyup_ops + opt->wbr_copyup;
+		break;
+
+	case Opt_dirwh:
+		sbinfo->si_dirwh = opt->dirwh;
 		break;
 
 	case Opt_rdcache:
@@ -1130,6 +1275,13 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 		break;
 	case Opt_rdhash_def:
 		sbinfo->si_rdhash = AUFS_RDHASH_DEF;
+		break;
+
+	case Opt_dirperm1:
+		au_opt_set(sbinfo->si_mntflags, DIRPERM1);
+		break;
+	case Opt_nodirperm1:
+		au_opt_clr(sbinfo->si_mntflags, DIRPERM1);
 		break;
 
 	case Opt_trunc_xino:
@@ -1178,7 +1330,7 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 static int au_opt_br(struct super_block *sb, struct au_opt *opt,
 		     struct au_opts *opts)
 {
-	int err;
+	int err, do_refresh;
 
 	err = 0;
 	switch (opt->type) {
@@ -1207,6 +1359,18 @@ static int au_opt_br(struct super_block *sb, struct au_opt *opt,
 			err = 1;
 			au_fset_opts(opts->flags, TRUNC_XIB);
 			au_fset_opts(opts->flags, REFRESH);
+		}
+		break;
+
+	case Opt_mod:
+	case Opt_imod:
+		err = au_br_mod(sb, &opt->mod,
+				au_ftest_opts(opts->flags, REMOUNT),
+				&do_refresh);
+		if (!err) {
+			err = 1;
+			if (do_refresh)
+				au_fset_opts(opts->flags, REFRESH);
 		}
 		break;
 	}
@@ -1261,6 +1425,14 @@ int au_opts_verify(struct super_block *sb, unsigned long sb_flags,
 		if (unlikely(!au_br_writable(au_sbr_perm(sb, 0))))
 			pr_warn("first branch should be rw\n");
 	}
+
+	if (au_opt_test((sbinfo->si_mntflags | pending), UDBA_HNOTIFY)
+	    && !au_opt_test(sbinfo->si_mntflags, XINO))
+		pr_warn_once("udba=*notify requires xino\n");
+
+	if (au_opt_test(sbinfo->si_mntflags, DIRPERM1))
+		pr_warn_once("dirperm1 breaks the protection"
+			     " by the permission bits on the lower branch\n");
 
 	err = 0;
 	root = sb->s_root;

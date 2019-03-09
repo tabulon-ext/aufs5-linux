@@ -13,6 +13,7 @@
 #ifdef __KERNEL__
 
 #include <linux/mount.h>
+#include "dirren.h"
 #include "dynop.h"
 #include "lcnt.h"
 #include "rwsem.h"
@@ -101,6 +102,8 @@ struct au_branch {
 	/* entries under sysfs per mount-point */
 	struct au_brsysfs	br_sysfs[AuBrSysfs_Last];
 #endif
+
+	struct au_dr_br		br_dirren;
 };
 
 /* ---------------------------------------------------------------------- */
@@ -180,6 +183,9 @@ struct au_opt_add;
 int au_br_add(struct super_block *sb, struct au_opt_add *add, int remount);
 struct au_opt_del;
 int au_br_del(struct super_block *sb, struct au_opt_del *del, int remount);
+struct au_opt_mod;
+int au_br_mod(struct super_block *sb, struct au_opt_mod *mod, int remount,
+	      int *do_refresh);
 
 /* xino.c */
 static const loff_t au_loff_max = LLONG_MAX;
