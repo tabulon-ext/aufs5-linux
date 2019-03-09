@@ -24,13 +24,16 @@ enum {
 	Opt_trunc_xino, Opt_trunc_xino_v, Opt_notrunc_xino,
 	Opt_trunc_xino_path, Opt_itrunc_xino,
 	Opt_trunc_xib, Opt_notrunc_xib,
+	Opt_shwh, Opt_noshwh,
 	Opt_plink, Opt_noplink, Opt_list_plink,
 	Opt_udba,
 	Opt_dio, Opt_nodio,
+	Opt_warn_perm, Opt_nowarn_perm,
 	Opt_wbr_copyup, Opt_wbr_create,
 	Opt_verbose, Opt_noverbose,
 	Opt_sum, Opt_nosum, Opt_wsum,
 	Opt_dirperm1, Opt_nodirperm1,
+	Opt_dirren, Opt_nodirren,
 	Opt_acl, Opt_noacl,
 	Opt_tail, Opt_ignore, Opt_ignore_silent, Opt_err
 };
@@ -84,6 +87,22 @@ static match_table_t options = {
 
 	{Opt_dio, "dio"},
 	{Opt_nodio, "nodio"},
+
+#ifdef CONFIG_AUFS_DIRREN
+	{Opt_dirren, "dirren"},
+	{Opt_nodirren, "nodirren"},
+#else
+	{Opt_ignore, "dirren"},
+	{Opt_ignore_silent, "nodirren"},
+#endif
+
+	{Opt_warn_perm, "warn_perm"},
+	{Opt_nowarn_perm, "nowarn_perm"},
+
+#ifdef CONFIG_AUFS_SHWH
+	{Opt_shwh, "shwh"},
+#endif
+	{Opt_noshwh, "noshwh"},
 
 	{Opt_dirperm1, "dirperm1"},
 	{Opt_nodirperm1, "nodirperm1"},
@@ -567,6 +586,12 @@ static void dump_opts(struct au_opts *opts)
 		case Opt_notrunc_xib:
 			AuLabel(notrunc_xib);
 			break;
+		case Opt_shwh:
+			AuLabel(shwh);
+			break;
+		case Opt_noshwh:
+			AuLabel(noshwh);
+			break;
 		case Opt_dirperm1:
 			AuLabel(dirperm1);
 			break;
@@ -591,6 +616,12 @@ static void dump_opts(struct au_opts *opts)
 			break;
 		case Opt_nodio:
 			AuLabel(nodio);
+			break;
+		case Opt_warn_perm:
+			AuLabel(warn_perm);
+			break;
+		case Opt_nowarn_perm:
+			AuLabel(nowarn_perm);
 			break;
 		case Opt_verbose:
 			AuLabel(verbose);
@@ -633,6 +664,12 @@ static void dump_opts(struct au_opts *opts)
 		case Opt_wbr_copyup:
 			AuDbg("copyup %d, %s\n", opt->wbr_copyup,
 				  au_optstr_wbr_copyup(opt->wbr_copyup));
+			break;
+		case Opt_dirren:
+			AuLabel(dirren);
+			break;
+		case Opt_nodirren:
+			AuLabel(nodirren);
 			break;
 		case Opt_acl:
 			AuLabel(acl);
@@ -1064,6 +1101,8 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 		case Opt_noxino:
 		case Opt_trunc_xib:
 		case Opt_notrunc_xib:
+		case Opt_shwh:
+		case Opt_noshwh:
 		case Opt_dirperm1:
 		case Opt_nodirperm1:
 		case Opt_plink:
@@ -1071,6 +1110,8 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 		case Opt_list_plink:
 		case Opt_dio:
 		case Opt_nodio:
+		case Opt_warn_perm:
+		case Opt_nowarn_perm:
 		case Opt_verbose:
 		case Opt_noverbose:
 		case Opt_sum:
@@ -1078,6 +1119,8 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 		case Opt_wsum:
 		case Opt_rdblk_def:
 		case Opt_rdhash_def:
+		case Opt_dirren:
+		case Opt_nodirren:
 		case Opt_acl:
 		case Opt_noacl:
 			err = 0;
@@ -1230,6 +1273,13 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 		au_fset_opts(opts->flags, REFRESH_DYAOP);
 		break;
 
+	case Opt_warn_perm:
+		au_opt_set(sbinfo->si_mntflags, WARN_PERM);
+		break;
+	case Opt_nowarn_perm:
+		au_opt_clr(sbinfo->si_mntflags, WARN_PERM);
+		break;
+
 	case Opt_verbose:
 		au_opt_set(sbinfo->si_mntflags, VERBOSE);
 		break;
@@ -1277,6 +1327,13 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 		sbinfo->si_rdhash = AUFS_RDHASH_DEF;
 		break;
 
+	case Opt_shwh:
+		au_opt_set(sbinfo->si_mntflags, SHWH);
+		break;
+	case Opt_noshwh:
+		au_opt_clr(sbinfo->si_mntflags, SHWH);
+		break;
+
 	case Opt_dirperm1:
 		au_opt_set(sbinfo->si_mntflags, DIRPERM1);
 		break;
@@ -1304,6 +1361,28 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 		break;
 	case Opt_notrunc_xib:
 		au_fclr_opts(opts->flags, TRUNC_XIB);
+		break;
+
+	case Opt_dirren:
+		err = 1;
+		if (!au_opt_test(sbinfo->si_mntflags, DIRREN)) {
+			err = au_dr_opt_set(sb);
+			if (!err)
+				err = 1;
+		}
+		if (err == 1)
+			au_opt_set(sbinfo->si_mntflags, DIRREN);
+		break;
+	case Opt_nodirren:
+		err = 1;
+		if (au_opt_test(sbinfo->si_mntflags, DIRREN)) {
+			err = au_dr_opt_clr(sb, au_ftest_opts(opts->flags,
+							      DR_FLUSHED));
+			if (!err)
+				err = 1;
+		}
+		if (err == 1)
+			au_opt_clr(sbinfo->si_mntflags, DIRREN);
 		break;
 
 	case Opt_acl:
@@ -1424,6 +1503,8 @@ int au_opts_verify(struct super_block *sb, unsigned long sb_flags,
 	if (!(sb_flags & SB_RDONLY)) {
 		if (unlikely(!au_br_writable(au_sbr_perm(sb, 0))))
 			pr_warn("first branch should be rw\n");
+		if (unlikely(au_opt_test(sbinfo->si_mntflags, SHWH)))
+			pr_warn_once("shwh should be used with ro\n");
 	}
 
 	if (au_opt_test((sbinfo->si_mntflags | pending), UDBA_HNOTIFY)
@@ -1625,7 +1706,11 @@ int au_opts_remount(struct super_block *sb, struct au_opts *opts)
 
 	SiMustWriteLock(sb);
 
-	err = 0;
+	err = au_dr_opt_flush(sb);
+	if (unlikely(err))
+		goto out;
+	au_fset_opts(opts->flags, DR_FLUSHED);
+
 	dir = d_inode(sb->s_root);
 	sbinfo = au_sbi(sb);
 	opt_xino = NULL;
@@ -1667,6 +1752,7 @@ int au_opts_remount(struct super_block *sb, struct au_opts *opts)
 
 	AuDbg("status 0x%x\n", opts->flags);
 
+out:
 	return err;
 }
 
