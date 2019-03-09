@@ -170,6 +170,8 @@ int aufs_symlink(struct inode *dir, struct dentry *dentry, const char *symname);
 int aufs_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 		bool want_excl);
 int aufs_tmpfile(struct inode *dir, struct dentry *dentry, umode_t mode);
+int aufs_link(struct dentry *src_dentry, struct inode *dir,
+	      struct dentry *dentry);
 int aufs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode);
 
 /* i_op_del.c */
@@ -178,6 +180,12 @@ int au_may_del(struct dentry *dentry, aufs_bindex_t bindex,
 	       struct dentry *h_parent, int isdir);
 int aufs_unlink(struct inode *dir, struct dentry *dentry);
 int aufs_rmdir(struct inode *dir, struct dentry *dentry);
+
+/* i_op_ren.c */
+int au_wbr(struct dentry *dentry, aufs_bindex_t btgt);
+int aufs_rename(struct inode *src_dir, struct dentry *src_dentry,
+		struct inode *dir, struct dentry *dentry,
+		unsigned int flags);
 
 /* iinfo.c */
 struct inode *au_h_iptr(struct inode *inode, aufs_bindex_t bindex);
