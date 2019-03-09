@@ -739,7 +739,7 @@ static int alloc_root(struct super_block *sb)
 	if (IS_ERR(inode))
 		goto out;
 
-	inode->i_op = &simple_dir_inode_operations; /* replace later */
+	inode->i_op = aufs_iop + AuIop_DIR;
 	inode->i_fop = &simple_dir_operations; /* replace later */
 	inode->i_mode = S_IFDIR;
 	set_nlink(inode, 2);
@@ -897,6 +897,8 @@ static void aufs_kill_sb(struct super_block *sb)
 
 struct file_system_type aufs_fs_type = {
 	.name		= AUFS_FSTYPE,
+	/* a race between rename and others */
+	.fs_flags	= FS_RENAME_DOES_D_MOVE,
 	.mount		= aufs_mount,
 	.kill_sb	= aufs_kill_sb,
 	/* no need to __module_get() and module_put(). */
