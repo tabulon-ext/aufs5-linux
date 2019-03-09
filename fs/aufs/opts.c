@@ -17,6 +17,8 @@
 enum {
 	Opt_br,
 	Opt_add,
+	Opt_rdcache, Opt_rdblk, Opt_rdhash,
+	Opt_rdblk_def, Opt_rdhash_def,
 	Opt_xino, Opt_noxino,
 	Opt_trunc_xino, Opt_trunc_xino_v, Opt_notrunc_xino,
 	Opt_trunc_xino_path, Opt_itrunc_xino,
@@ -59,6 +61,12 @@ static match_table_t options = {
 
 	{Opt_dio, "dio"},
 	{Opt_nodio, "nodio"},
+
+	{Opt_rdcache, "rdcache=%d"},
+	{Opt_rdblk, "rdblk=%d"},
+	{Opt_rdblk_def, "rdblk=def"},
+	{Opt_rdhash, "rdhash=%d"},
+	{Opt_rdhash_def, "rdhash=def"},
 
 	{Opt_wbr_create, "create=%s"},
 	{Opt_wbr_create, "create_policy=%s"},
@@ -436,6 +444,21 @@ static void dump_opts(struct au_opts *opts)
 				  u.add->bindex, u.add->pathname, u.add->perm,
 				  u.add->path.dentry);
 			break;
+		case Opt_rdcache:
+			AuDbg("rdcache %d\n", opt->rdcache);
+			break;
+		case Opt_rdblk:
+			AuDbg("rdblk %u\n", opt->rdblk);
+			break;
+		case Opt_rdblk_def:
+			AuDbg("rdblk_def\n");
+			break;
+		case Opt_rdhash:
+			AuDbg("rdhash %u\n", opt->rdhash);
+			break;
+		case Opt_rdhash_def:
+			AuDbg("rdhash_def\n");
+			break;
 		case Opt_xino:
 			u.xino = &opt->xino;
 			AuDbg("xino {%s %pD}\n", u.xino->path, u.xino->file);
@@ -723,6 +746,49 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 			opt->type = token;
 			break;
 
+		case Opt_rdcache:
+			if (unlikely(match_int(&a->args[0], &n))) {
+				pr_err("bad integer in %s\n", opt_str);
+				break;
+			}
+			if (unlikely(n > AUFS_RDCACHE_MAX)) {
+				pr_err("rdcache must be smaller than %d\n",
+				       AUFS_RDCACHE_MAX);
+				break;
+			}
+			opt->rdcache = n;
+			err = 0;
+			opt->type = token;
+			break;
+		case Opt_rdblk:
+			if (unlikely(match_int(&a->args[0], &n)
+				     || n < 0
+				     || n > KMALLOC_MAX_SIZE)) {
+				pr_err("bad integer in %s\n", opt_str);
+				break;
+			}
+			if (unlikely(n && n < NAME_MAX)) {
+				pr_err("rdblk must be larger than %d\n",
+				       NAME_MAX);
+				break;
+			}
+			opt->rdblk = n;
+			err = 0;
+			opt->type = token;
+			break;
+		case Opt_rdhash:
+			if (unlikely(match_int(&a->args[0], &n)
+				     || n < 0
+				     || n * sizeof(struct hlist_head)
+				     > KMALLOC_MAX_SIZE)) {
+				pr_err("bad integer in %s\n", opt_str);
+				break;
+			}
+			opt->rdhash = n;
+			err = 0;
+			opt->type = token;
+			break;
+
 		case Opt_trunc_xino:
 		case Opt_notrunc_xino:
 		case Opt_noxino:
@@ -733,6 +799,8 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 		case Opt_list_plink:
 		case Opt_dio:
 		case Opt_nodio:
+		case Opt_rdblk_def:
+		case Opt_rdhash_def:
 			err = 0;
 			opt->type = token;
 			break;
@@ -891,6 +959,23 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 		sbinfo->si_wbr_copyup_ops = au_wbr_copyup_ops + opt->wbr_copyup;
 		break;
 
+	case Opt_rdcache:
+		sbinfo->si_rdcache
+			= msecs_to_jiffies(opt->rdcache * MSEC_PER_SEC);
+		break;
+	case Opt_rdblk:
+		sbinfo->si_rdblk = opt->rdblk;
+		break;
+	case Opt_rdblk_def:
+		sbinfo->si_rdblk = AUFS_RDBLK_DEF;
+		break;
+	case Opt_rdhash:
+		sbinfo->si_rdhash = opt->rdhash;
+		break;
+	case Opt_rdhash_def:
+		sbinfo->si_rdhash = AUFS_RDHASH_DEF;
+		break;
+
 	case Opt_trunc_xino:
 		au_opt_set(sbinfo->si_mntflags, TRUNC_XINO);
 		break;
@@ -935,10 +1020,11 @@ static int au_opt_br(struct super_block *sb, struct au_opt *opt,
 	err = 0;
 	switch (opt->type) {
 	case Opt_add:
-		err = au_br_add(sb, &opt->add);
+		err = au_br_add(sb, &opt->add,
+				au_ftest_opts(opts->flags, REMOUNT));
 		if (!err) {
 			err = 1;
-			/* au_fset_opts(opts->flags, REFRESH); re-commit later */
+			au_fset_opts(opts->flags, REFRESH);
 		}
 		break;
 	}
@@ -954,7 +1040,8 @@ static int au_opt_xino(struct super_block *sb, struct au_opt *opt,
 	err = 0;
 	switch (opt->type) {
 	case Opt_xino:
-		err = au_xino_set(sb, &opt->xino);
+		err = au_xino_set(sb, &opt->xino,
+				  !!au_ftest_opts(opts->flags, REMOUNT));
 		if (unlikely(err))
 			break;
 
@@ -1120,7 +1207,7 @@ int au_opts_mount(struct super_block *sb, struct au_opts *opts)
 		if (IS_ERR(xino.file))
 			goto out;
 
-		err = au_xino_set(sb, &xino);
+		err = au_xino_set(sb, &xino, /*remount*/0);
 		fput(xino.file);
 		if (unlikely(err))
 			goto out;
@@ -1145,6 +1232,54 @@ int au_opts_mount(struct super_block *sb, struct au_opts *opts)
 	}
 
 out:
+	return err;
+}
+
+int au_opts_remount(struct super_block *sb, struct au_opts *opts)
+{
+	int err, rerr;
+	struct inode *dir;
+	struct au_opt_xino *opt_xino;
+	struct au_opt *opt;
+	struct au_sbinfo *sbinfo;
+
+	SiMustWriteLock(sb);
+
+	err = 0;
+	dir = d_inode(sb->s_root);
+	sbinfo = au_sbi(sb);
+	opt_xino = NULL;
+	opt = opts->opt;
+	while (err >= 0 && opt->type != Opt_tail) {
+		err = au_opt_simple(sb, opt, opts);
+		if (!err)
+			err = au_opt_br(sb, opt, opts);
+		if (!err)
+			err = au_opt_xino(sb, opt, &opt_xino, opts);
+		opt++;
+	}
+	if (err > 0)
+		err = 0;
+	AuTraceErr(err);
+	/* go on even err */
+
+	rerr = au_opts_verify(sb, opts->sb_flags, /*pending*/0);
+	if (unlikely(rerr && !err))
+		err = rerr;
+
+	if (au_ftest_opts(opts->flags, TRUNC_XIB)) {
+		rerr = au_xib_trunc(sb);
+		if (unlikely(rerr && !err))
+			err = rerr;
+	}
+
+	/* will be handled by the caller */
+	if (!au_ftest_opts(opts->flags, REFRESH)
+	    && (opts->given_udba || au_opt_test(sbinfo->si_mntflags, XINO)))
+		au_fset_opts(opts->flags, REFRESH);
+
+	AuDbg("status 0x%x\n", opts->flags);
+
 	return err;
 }
 
