@@ -10,6 +10,7 @@
 #include <linux/iversion.h>
 #include <linux/mm.h>
 #include <linux/seq_file.h>
+#include <linux/statfs.h>
 #include <linux/vmalloc.h>
 #include "aufs.h"
 
@@ -75,7 +76,6 @@ out:
 }
 
 /* lock free root dinfo */
-/* re-commit later */ __maybe_unused
 static int au_show_brs(struct seq_file *seq, struct super_block *sb)
 {
 	int err;
@@ -120,7 +120,6 @@ static void au_gen_fmt(char *fmt, int len __maybe_unused, const char *pat,
 	AuDebugOn(strlen(fmt) >= len);
 }
 
-/* re-commit later */ __maybe_unused
 static void au_show_wbr_create(struct seq_file *m, int v,
 			       struct au_sbinfo *sbinfo)
 {
@@ -165,7 +164,6 @@ static void au_show_wbr_create(struct seq_file *m, int v,
 	}
 }
 
-/* re-commit later */ __maybe_unused
 static int au_show_xino(struct seq_file *seq, struct super_block *sb)
 {
 #ifdef CONFIG_SYSFS
@@ -208,6 +206,138 @@ static int au_show_xino(struct seq_file *seq, struct super_block *sb)
 out:
 	return err;
 #endif
+}
+
+/* seq_file will re-call me in case of too long string */
+static int aufs_show_options(struct seq_file *m, struct dentry *dentry)
+{
+	int err;
+	unsigned int mnt_flags, v;
+	struct super_block *sb;
+	struct au_sbinfo *sbinfo;
+
+#define AuBool(name, str) do { \
+	v = au_opt_test(mnt_flags, name); \
+	if (v != au_opt_test(AuOpt_Def, name)) \
+		seq_printf(m, ",%s" #str, v ? "" : "no"); \
+} while (0)
+
+#define AuStr(name, str) do { \
+	v = mnt_flags & AuOptMask_##name; \
+	if (v != (AuOpt_Def & AuOptMask_##name)) \
+		seq_printf(m, "," #str "=%s", au_optstr_##str(v)); \
+} while (0)
+
+#define AuUInt(name, str, val) do { \
+	if (val != AUFS_##name##_DEF) \
+		seq_printf(m, "," #str "=%u", val); \
+} while (0)
+
+	sb = dentry->d_sb;
+#if 0
+	if (sb->s_flags & SB_I_VERSION)
+		seq_puts(m, ",i_version");
+#endif
+
+	/* lock free root dinfo */
+	si_noflush_read_lock(sb);
+	sbinfo = au_sbi(sb);
+	seq_printf(m, ",si=%lx", sysaufs_si_id(sbinfo));
+
+	mnt_flags = au_mntflags(sb);
+	if (au_opt_test(mnt_flags, XINO)) {
+		err = au_show_xino(m, sb);
+		if (unlikely(err))
+			goto out;
+	} else
+		seq_puts(m, ",noxino");
+
+	AuBool(TRUNC_XINO, trunc_xino);
+	AuStr(UDBA, udba);
+	AuBool(PLINK, plink);
+	AuBool(DIO, dio);
+
+	v = sbinfo->si_wbr_create;
+	if (v != AuWbrCreate_Def)
+		au_show_wbr_create(m, v, sbinfo);
+
+	v = sbinfo->si_wbr_copyup;
+	if (v != AuWbrCopyup_Def)
+		seq_printf(m, ",cpup=%s", au_optstr_wbr_copyup(v));
+
+	v = jiffies_to_msecs(sbinfo->si_rdcache) / MSEC_PER_SEC;
+	AuUInt(RDCACHE, rdcache, v);
+
+	AuUInt(RDBLK, rdblk, sbinfo->si_rdblk);
+	AuUInt(RDHASH, rdhash, sbinfo->si_rdhash);
+
+out:
+	/* be sure to print "br:" last */
+	if (!sysaufs_brs) {
+		seq_puts(m, ",br:");
+		au_show_brs(m, sb);
+	}
+	si_read_unlock(sb);
+	return 0;
+
+#undef AuBool
+#undef AuStr
+#undef AuUInt
+}
+
+/* ---------------------------------------------------------------------- */
+
+static int aufs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+	int err;
+	struct path h_path;
+	struct super_block *sb;
+
+	/* lock free root dinfo */
+	sb = dentry->d_sb;
+	si_noflush_read_lock(sb);
+	/* sb->s_root for NFS is unreliable */
+	h_path.mnt = au_sbr_mnt(sb, 0);
+	h_path.dentry = h_path.mnt->mnt_root;
+	err = vfs_statfs(&h_path, buf);
+	si_read_unlock(sb);
+
+	if (!err) {
+		buf->f_type = AUFS_SUPER_MAGIC;
+		buf->f_namelen = AUFS_MAX_NAMELEN;
+		memset(&buf->f_fsid, 0, sizeof(buf->f_fsid));
+	}
+	/* buf->f_bsize = buf->f_blocks = buf->f_bfree = buf->f_bavail = -1; */
+
+	return err;
+}
+
+/* ---------------------------------------------------------------------- */
+
+static int aufs_sync_fs(struct super_block *sb, int wait)
+{
+	int err, e;
+	aufs_bindex_t bbot, bindex;
+	struct au_branch *br;
+	struct super_block *h_sb;
+
+	err = 0;
+	si_noflush_read_lock(sb);
+	bbot = au_sbbot(sb);
+	for (bindex = 0; bindex <= bbot; bindex++) {
+		br = au_sbr(sb, bindex);
+		if (!au_br_writable(br->br_perm))
+			continue;
+
+		h_sb = au_sbr_sb(sb, bindex);
+		e = vfsub_sync_filesystem(h_sb, wait);
+		if (unlikely(e && !err))
+			err = e;
+		/* go on even if an error happens */
+	}
+	si_read_unlock(sb);
+
+	return err;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -330,7 +460,7 @@ static int au_do_refresh(struct dentry *dentry, unsigned int dir_flags,
 
 static int au_do_refresh_d(struct dentry *dentry, unsigned int sigen,
 			   struct au_sbinfo *sbinfo,
-			   const unsigned int dir_flags)
+			   const unsigned int dir_flags, unsigned int do_dop)
 {
 	int err;
 	struct dentry *parent;
@@ -353,11 +483,17 @@ static int au_do_refresh_d(struct dentry *dentry, unsigned int sigen,
 	}
 	dput(parent);
 
+	if (!err) {
+		if (do_dop)
+			au_refresh_dop(dentry, /*force_reval*/0);
+	} else
+		au_refresh_dop(dentry, /*force_reval*/1);
+
 	AuTraceErr(err);
 	return err;
 }
 
-static int au_refresh_d(struct super_block *sb)
+static int au_refresh_d(struct super_block *sb, unsigned int do_dop)
 {
 	int err, i, j, ndentry, e;
 	unsigned int sigen;
@@ -367,6 +503,9 @@ static int au_refresh_d(struct super_block *sb)
 	struct au_sbinfo *sbinfo;
 	struct dentry *root = sb->s_root;
 	const unsigned int dir_flags = au_hi_flags(d_inode(root), /*isdir*/1);
+
+	if (do_dop)
+		au_refresh_dop(root, /*force_reval*/0);
 
 	err = au_dpages_init(&dpages, GFP_NOFS);
 	if (unlikely(err))
@@ -383,7 +522,8 @@ static int au_refresh_d(struct super_block *sb)
 		ndentry = dpage->ndentry;
 		for (j = 0; j < ndentry; j++) {
 			d = dentries[j];
-			e = au_do_refresh_d(d, sigen, sbinfo, dir_flags);
+			e = au_do_refresh_d(d, sigen, sbinfo, dir_flags,
+					    do_dop);
 			if (unlikely(e && !err))
 				err = e;
 			/* go on even err */
@@ -433,7 +573,7 @@ out:
 	return err;
 }
 
-static void au_remount_refresh(struct super_block *sb)
+static void au_remount_refresh(struct super_block *sb, unsigned int do_dop)
 {
 	int err, e;
 	unsigned int udba;
@@ -441,9 +581,11 @@ static void au_remount_refresh(struct super_block *sb)
 	struct dentry *root;
 	struct inode *inode;
 	struct au_branch *br;
+	struct au_sbinfo *sbi;
 
 	au_sigen_inc(sb);
-	au_fclr_si(au_sbi(sb), FAILED_REFRESH_DIR);
+	sbi = au_sbi(sb);
+	au_fclr_si(sbi, FAILED_REFRESH_DIR);
 
 	root = sb->s_root;
 	DiMustNoWaiters(root);
@@ -462,8 +604,19 @@ static void au_remount_refresh(struct super_block *sb)
 	}
 	au_hn_reset(inode, au_hi_flags(inode, /*isdir*/1));
 
+	if (do_dop) {
+		if (au_ftest_si(sbi, NO_DREVAL)) {
+			AuDebugOn(sb->s_d_op == &aufs_dop_noreval);
+			sb->s_d_op = &aufs_dop_noreval;
+		} else {
+			AuDebugOn(sb->s_d_op == &aufs_dop);
+			sb->s_d_op = &aufs_dop;
+		}
+		pr_info("reset to %ps\n", sb->s_d_op);
+	}
+
 	di_write_unlock(root);
-	err = au_refresh_d(sb);
+	err = au_refresh_d(sb, do_dop);
 	e = au_refresh_i(sb);
 	if (unlikely(e && !err))
 		err = e;
@@ -540,7 +693,7 @@ static int aufs_remount_fs(struct super_block *sb, int *flags, char *data)
 	au_opts_free(&opts);
 
 	if (au_ftest_opts(opts.flags, REFRESH))
-		au_remount_refresh(sb);
+		au_remount_refresh(sb, au_ftest_opts(opts.flags, REFRESH_DOP));
 
 	if (au_ftest_opts(opts.flags, REFRESH_DYAOP)) {
 		mntflags = au_mntflags(sb);
@@ -565,7 +718,10 @@ static const struct super_operations aufs_sop = {
 	.destroy_inode	= aufs_destroy_inode,
 	/* always deleting, no clearing */
 	.drop_inode	= generic_delete_inode,
+	.show_options	= aufs_show_options,
+	.statfs		= aufs_statfs,
 	.put_super	= aufs_put_super,
+	.sync_fs	= aufs_sync_fs,
 	.remount_fs	= aufs_remount_fs
 };
 
@@ -614,6 +770,7 @@ static int aufs_fill_super(struct super_block *sb, void *raw_data,
 	struct au_opts opts = {
 		.opt = NULL
 	};
+	struct au_sbinfo *sbinfo;
 	struct dentry *root;
 	struct inode *inode;
 	char *arg = raw_data;
@@ -634,12 +791,13 @@ static int aufs_fill_super(struct super_block *sb, void *raw_data,
 	err = au_si_alloc(sb);
 	if (unlikely(err))
 		goto out_opts;
+	sbinfo = au_sbi(sb);
 
 	/* all timestamps always follow the ones on the branch */
 	sb->s_flags |= SB_NOATIME | SB_NODIRATIME;
 	sb->s_flags |= SB_I_VERSION; /* do we really need this? */
 	sb->s_op = &aufs_sop;
-	sb->s_d_op = &simple_dentry_operations;  /* replace later */
+	sb->s_d_op = &aufs_dop;
 	sb->s_magic = AUFS_SUPER_MAGIC;
 	sb->s_maxbytes = 0;
 	sb->s_stack_depth = 1;
@@ -668,6 +826,11 @@ static int aufs_fill_super(struct super_block *sb, void *raw_data,
 	aufs_write_lock(root);
 	err = au_opts_mount(sb, &opts);
 	au_opts_free(&opts);
+	if (!err && au_ftest_si(sbinfo, NO_DREVAL)) {
+		sb->s_d_op = &aufs_dop_noreval;
+		pr_info("%ps\n", sb->s_d_op);
+		au_refresh_dop(root, /*force_reval*/0);
+	}
 	aufs_write_unlock(root);
 	inode_unlock(inode);
 	if (!err)
@@ -677,7 +840,7 @@ out_root:
 	dput(root);
 	sb->s_root = NULL;
 out_info:
-	kobject_put(&au_sbi(sb)->si_kobj);
+	kobject_put(&sbinfo->si_kobj);
 	sb->s_fs_info = NULL;
 out_opts:
 	free_page((unsigned long)opts.opt);
@@ -720,7 +883,7 @@ static void aufs_kill_sb(struct super_block *sb)
 			sbinfo->si_wbr_create_ops->fin(sb);
 		if (au_opt_test(sbinfo->si_mntflags, UDBA_HNOTIFY)) {
 			au_opt_set_udba(sbinfo->si_mntflags, UDBA_NONE);
-			au_remount_refresh(sb);
+			au_remount_refresh(sb, /*do_idop*/0);
 		}
 		if (au_opt_test(sbinfo->si_mntflags, PLINK))
 			au_plink_put(sb, /*verbose*/1);
