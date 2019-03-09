@@ -26,6 +26,7 @@ struct file;
 #define AuOpt_UDBA_REVAL	(1 << 3)
 #define AuOpt_UDBA_HNOTIFY	(1 << 4)
 #define AuOpt_PLINK		(1 << 6)	/* pseudo-link */
+#define AuOpt_VERBOSE		(1 << 13)	/* print the cause of error */
 #define AuOpt_DIO		(1 << 14)	/* direct io */
 
 #ifndef CONFIG_AUFS_HNOTIFY
@@ -99,6 +100,11 @@ struct au_opt_add {
 	struct path	path;
 };
 
+struct au_opt_del {
+	char		*pathname;
+	struct path	h_path;
+};
+
 struct au_opt_xino {
 	char		*path;
 	struct file	*file;
@@ -120,6 +126,7 @@ struct au_opt {
 		struct au_opt_xino	xino;
 		struct au_opt_xino_itrunc xino_itrunc;
 		struct au_opt_add	add;
+		struct au_opt_del	del;
 		int			rdcache;
 		unsigned int		rdblk;
 		unsigned int		rdhash;

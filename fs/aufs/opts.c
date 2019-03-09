@@ -16,7 +16,8 @@
 
 enum {
 	Opt_br,
-	Opt_add,
+	Opt_add, Opt_del, Opt_append, Opt_prepend,
+	Opt_idel,
 	Opt_rdcache, Opt_rdblk, Opt_rdhash,
 	Opt_rdblk_def, Opt_rdhash_def,
 	Opt_xino, Opt_noxino,
@@ -27,6 +28,7 @@ enum {
 	Opt_udba,
 	Opt_dio, Opt_nodio,
 	Opt_wbr_copyup, Opt_wbr_create,
+	Opt_verbose, Opt_noverbose,
 	Opt_acl, Opt_noacl,
 	Opt_tail, Opt_ignore, Opt_ignore_silent, Opt_err
 };
@@ -34,6 +36,19 @@ enum {
 static match_table_t options = {
 	{Opt_br, "br=%s"},
 	{Opt_br, "br:%s"},
+
+	{Opt_add, "add=%d:%s"},
+	{Opt_add, "add:%d:%s"},
+	{Opt_add, "ins=%d:%s"},
+	{Opt_add, "ins:%d:%s"},
+	{Opt_append, "append=%s"},
+	{Opt_append, "append:%s"},
+	{Opt_prepend, "prepend=%s"},
+	{Opt_prepend, "prepend:%s"},
+
+	{Opt_del, "del=%s"},
+	{Opt_del, "del:%s"},
+	/* {Opt_idel, "idel:%d"}, */
 
 	{Opt_xino, "xino=%s"},
 	{Opt_noxino, "noxino"},
@@ -62,6 +77,13 @@ static match_table_t options = {
 
 	{Opt_dio, "dio"},
 	{Opt_nodio, "nodio"},
+
+	{Opt_verbose, "verbose"},
+	{Opt_verbose, "v"},
+	{Opt_noverbose, "noverbose"},
+	{Opt_noverbose, "quiet"},
+	{Opt_noverbose, "q"},
+	{Opt_noverbose, "silent"},
 
 	{Opt_rdcache, "rdcache=%d"},
 	{Opt_rdblk, "rdblk=%d"},
@@ -448,6 +470,7 @@ static void dump_opts(struct au_opts *opts)
 	/* reduce stack space */
 	union {
 		struct au_opt_add *add;
+		struct au_opt_del *del;
 		struct au_opt_xino *xino;
 		struct au_opt_xino_itrunc *xino_itrunc;
 		struct au_opt_wbr_create *create;
@@ -460,6 +483,24 @@ static void dump_opts(struct au_opts *opts)
 		case Opt_add:
 			u.add = &opt->add;
 			AuDbg("add {b%d, %s, 0x%x, %p}\n",
+				  u.add->bindex, u.add->pathname, u.add->perm,
+				  u.add->path.dentry);
+			break;
+		case Opt_del:
+		case Opt_idel:
+			u.del = &opt->del;
+			AuDbg("del {%s, %p}\n",
+			      u.del->pathname, u.del->h_path.dentry);
+			break;
+		case Opt_append:
+			u.add = &opt->add;
+			AuDbg("append {b%d, %s, 0x%x, %p}\n",
+				  u.add->bindex, u.add->pathname, u.add->perm,
+				  u.add->path.dentry);
+			break;
+		case Opt_prepend:
+			u.add = &opt->add;
+			AuDbg("prepend {b%d, %s, 0x%x, %p}\n",
 				  u.add->bindex, u.add->pathname, u.add->perm,
 				  u.add->path.dentry);
 			break;
@@ -521,6 +562,12 @@ static void dump_opts(struct au_opts *opts)
 		case Opt_nodio:
 			AuLabel(nodio);
 			break;
+		case Opt_verbose:
+			AuLabel(verbose);
+			break;
+		case Opt_noverbose:
+			AuLabel(noverbose);
+			break;
 		case Opt_wbr_create:
 			u.create = &opt->wbr_create;
 			AuDbg("create %d, %s\n", u.create->wbr_create,
@@ -570,7 +617,13 @@ void au_opts_free(struct au_opts *opts)
 	while (opt->type != Opt_tail) {
 		switch (opt->type) {
 		case Opt_add:
+		case Opt_append:
+		case Opt_prepend:
 			path_put(&opt->add.path);
+			break;
+		case Opt_del:
+		case Opt_idel:
+			path_put(&opt->del.h_path);
 			break;
 		case Opt_xino:
 			fput(opt->xino.file);
@@ -615,6 +668,45 @@ static int opt_add(struct au_opt *opt, char *opt_str, unsigned long sb_flags,
 out:
 	return err;
 }
+
+static int au_opts_parse_del(struct au_opt_del *del, substring_t args[])
+{
+	int err;
+
+	del->pathname = args[0].from;
+	AuDbg("del path %s\n", del->pathname);
+
+	err = vfsub_kern_path(del->pathname, lkup_dirflags, &del->h_path);
+	if (unlikely(err))
+		pr_err("lookup failed %s (%d)\n", del->pathname, err);
+
+	return err;
+}
+
+#if 0 /* reserved for future use */
+static int au_opts_parse_idel(struct super_block *sb, aufs_bindex_t bindex,
+			      struct au_opt_del *del, substring_t args[])
+{
+	int err;
+	struct dentry *root;
+
+	err = -EINVAL;
+	root = sb->s_root;
+	aufs_read_lock(root, AuLock_FLUSH);
+	if (bindex < 0 || au_sbbot(sb) < bindex) {
+		pr_err("out of bounds, %d\n", bindex);
+		goto out;
+	}
+
+	err = 0;
+	del->h_path.dentry = dget(au_h_dptr(root, bindex));
+	del->h_path.mnt = mntget(au_sbr_mnt(sb, bindex));
+
+out:
+	aufs_read_unlock(root, !AuLock_IR);
+	return err;
+}
+#endif
 
 static int au_opts_parse_xino(struct super_block *sb, struct au_opt_xino *xino,
 			      substring_t args[])
@@ -739,7 +831,35 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 			if (!err)
 				opt->type = token;
 			break;
-
+		case Opt_append:
+			err = opt_add(opt, a->args[0].from, opts->sb_flags,
+				      /*dummy bindex*/1);
+			if (!err)
+				opt->type = token;
+			break;
+		case Opt_prepend:
+			err = opt_add(opt, a->args[0].from, opts->sb_flags,
+				      /*bindex*/0);
+			if (!err)
+				opt->type = token;
+			break;
+		case Opt_del:
+			err = au_opts_parse_del(&opt->del, a->args);
+			if (!err)
+				opt->type = token;
+			break;
+#if 0 /* reserved for future use */
+		case Opt_idel:
+			del->pathname = "(indexed)";
+			if (unlikely(match_int(&args[0], &n))) {
+				pr_err("bad integer in %s\n", opt_str);
+				break;
+			}
+			err = au_opts_parse_idel(sb, n, &opt->del, a->args);
+			if (!err)
+				opt->type = token;
+			break;
+#endif
 		case Opt_xino:
 			err = au_opts_parse_xino(sb, &opt->xino, a->args);
 			if (!err)
@@ -824,6 +944,8 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 		case Opt_list_plink:
 		case Opt_dio:
 		case Opt_nodio:
+		case Opt_verbose:
+		case Opt_noverbose:
 		case Opt_rdblk_def:
 		case Opt_rdhash_def:
 		case Opt_acl:
@@ -978,6 +1100,13 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 		au_fset_opts(opts->flags, REFRESH_DYAOP);
 		break;
 
+	case Opt_verbose:
+		au_opt_set(sbinfo->si_mntflags, VERBOSE);
+		break;
+	case Opt_noverbose:
+		au_opt_clr(sbinfo->si_mntflags, VERBOSE);
+		break;
+
 	case Opt_wbr_create:
 		err = au_opt_wbr_create(sb, &opt->wbr_create);
 		break;
@@ -1053,11 +1182,30 @@ static int au_opt_br(struct super_block *sb, struct au_opt *opt,
 
 	err = 0;
 	switch (opt->type) {
+	case Opt_append:
+		opt->add.bindex = au_sbbot(sb) + 1;
+		if (opt->add.bindex < 0)
+			opt->add.bindex = 0;
+		goto add;
+	case Opt_prepend:
+		opt->add.bindex = 0;
+	add: /* indented label */
 	case Opt_add:
 		err = au_br_add(sb, &opt->add,
 				au_ftest_opts(opts->flags, REMOUNT));
 		if (!err) {
 			err = 1;
+			au_fset_opts(opts->flags, REFRESH);
+		}
+		break;
+
+	case Opt_del:
+	case Opt_idel:
+		err = au_br_del(sb, &opt->del,
+				au_ftest_opts(opts->flags, REMOUNT));
+		if (!err) {
+			err = 1;
+			au_fset_opts(opts->flags, TRUNC_XIB);
 			au_fset_opts(opts->flags, REFRESH);
 		}
 		break;
