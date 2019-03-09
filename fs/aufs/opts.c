@@ -7,6 +7,7 @@
  * mount options/flags
  */
 
+#include <linux/file.h>
 #include <linux/namei.h>
 #include <linux/types.h> /* a distribution requires */
 #include <linux/parser.h>
@@ -17,12 +18,27 @@
 enum {
 	Opt_br,
 	Opt_add,
+	Opt_xino, Opt_noxino,
+	Opt_trunc_xino, Opt_trunc_xino_v, Opt_notrunc_xino,
+	Opt_trunc_xino_path, Opt_itrunc_xino,
+	Opt_trunc_xib, Opt_notrunc_xib,
 	Opt_tail, Opt_ignore, Opt_ignore_silent, Opt_err
 };
 
 static match_table_t options = {
 	{Opt_br, "br=%s"},
 	{Opt_br, "br:%s"},
+
+	{Opt_xino, "xino=%s"},
+	{Opt_noxino, "noxino"},
+	{Opt_trunc_xino, "trunc_xino"},
+	{Opt_trunc_xino_v, "trunc_xino_v=%d:%d"},
+	{Opt_notrunc_xino, "notrunc_xino"},
+	{Opt_trunc_xino_path, "trunc_xino=%s"},
+	{Opt_itrunc_xino, "itrunc_xino=%d"},
+	/* {Opt_zxino, "zxino=%s"}, */
+	{Opt_trunc_xib, "trunc_xib"},
+	{Opt_notrunc_xib, "notrunc_xib"},
 
 	/* internal use for the scripts */
 	{Opt_ignore_silent, "si=%s"},
@@ -185,6 +201,8 @@ static void dump_opts(struct au_opts *opts)
 	/* reduce stack space */
 	union {
 		struct au_opt_add *add;
+		struct au_opt_xino *xino;
+		struct au_opt_xino_itrunc *xino_itrunc;
 	} u;
 	struct au_opt *opt;
 
@@ -196,6 +214,30 @@ static void dump_opts(struct au_opts *opts)
 			AuDbg("add {b%d, %s, 0x%x, %p}\n",
 				  u.add->bindex, u.add->pathname, u.add->perm,
 				  u.add->path.dentry);
+			break;
+		case Opt_xino:
+			u.xino = &opt->xino;
+			AuDbg("xino {%s %pD}\n", u.xino->path, u.xino->file);
+			break;
+		case Opt_trunc_xino:
+			AuLabel(trunc_xino);
+			break;
+		case Opt_notrunc_xino:
+			AuLabel(notrunc_xino);
+			break;
+		case Opt_trunc_xino_path:
+		case Opt_itrunc_xino:
+			u.xino_itrunc = &opt->xino_itrunc;
+			AuDbg("trunc_xino %d\n", u.xino_itrunc->bindex);
+			break;
+		case Opt_noxino:
+			AuLabel(noxino);
+			break;
+		case Opt_trunc_xib:
+			AuLabel(trunc_xib);
+			break;
+		case Opt_notrunc_xib:
+			AuLabel(notrunc_xib);
 			break;
 		default:
 			BUG();
@@ -214,6 +256,9 @@ void au_opts_free(struct au_opts *opts)
 		switch (opt->type) {
 		case Opt_add:
 			path_put(&opt->add.path);
+			break;
+		case Opt_xino:
+			fput(opt->xino.file);
 			break;
 		}
 		opt++;
@@ -252,6 +297,72 @@ out:
 	return err;
 }
 
+static int au_opts_parse_xino(struct super_block *sb, struct au_opt_xino *xino,
+			      substring_t args[])
+{
+	int err;
+	struct file *file;
+
+	file = au_xino_create(sb, args[0].from, /*silent*/0);
+	err = PTR_ERR(file);
+	if (IS_ERR(file))
+		goto out;
+
+	err = -EINVAL;
+	if (unlikely(file->f_path.dentry->d_sb == sb)) {
+		fput(file);
+		pr_err("%s must be outside\n", args[0].from);
+		goto out;
+	}
+
+	err = 0;
+	xino->file = file;
+	xino->path = args[0].from;
+
+out:
+	return err;
+}
+
+static int noinline_for_stack
+au_opts_parse_xino_itrunc_path(struct super_block *sb,
+			       struct au_opt_xino_itrunc *xino_itrunc,
+			       substring_t args[])
+{
+	int err;
+	aufs_bindex_t bbot, bindex;
+	struct path path;
+	struct dentry *root;
+
+	err = vfsub_kern_path(args[0].from, lkup_dirflags, &path);
+	if (unlikely(err)) {
+		pr_err("lookup failed %s (%d)\n", args[0].from, err);
+		goto out;
+	}
+
+	xino_itrunc->bindex = -1;
+	root = sb->s_root;
+	si_read_lock(sb, AuLock_FLUSH);
+	di_read_lock_child(root, /*flags*/0);
+	bbot = au_sbbot(sb);
+	for (bindex = 0; bindex <= bbot; bindex++) {
+		if (au_h_dptr(root, bindex) == path.dentry) {
+			xino_itrunc->bindex = bindex;
+			break;
+		}
+	}
+	di_read_unlock(root, /*flags*/0);
+	si_read_unlock(sb);
+	path_put(&path);
+
+	if (unlikely(xino_itrunc->bindex < 0)) {
+		pr_err("no such branch %s\n", args[0].from);
+		err = -EINVAL;
+	}
+
+out:
+	return err;
+}
+
 /* called without aufs lock */
 int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 {
@@ -262,6 +373,10 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 	struct au_opt *opt, *opt_tail;
 	char *opt_str;
 	/* reduce the stack space */
+	union {
+		struct au_opt_xino_itrunc *xino_itrunc;
+		struct au_opt_wbr_create *create;
+	} u;
 	struct {
 		substring_t args[MAX_OPT_ARGS];
 	} *a;
@@ -308,6 +423,49 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 				opt->type = token;
 			break;
 
+		case Opt_xino:
+			err = au_opts_parse_xino(sb, &opt->xino, a->args);
+			if (!err)
+				opt->type = token;
+			break;
+
+		case Opt_trunc_xino_path:
+			err = au_opts_parse_xino_itrunc_path
+				(sb, &opt->xino_itrunc, a->args);
+			if (!err)
+				opt->type = token;
+			break;
+
+		case Opt_itrunc_xino:
+			u.xino_itrunc = &opt->xino_itrunc;
+			if (unlikely(match_int(&a->args[0], &n))) {
+				pr_err("bad integer in %s\n", opt_str);
+				break;
+			}
+			u.xino_itrunc->bindex = n;
+			si_read_lock(sb, AuLock_FLUSH);
+			di_read_lock_child(root, !AuLock_IR);
+			if (n < 0 || au_sbbot(sb) < n) {
+				pr_err("out of bounds, %d\n", n);
+				di_read_unlock(root, !AuLock_IR);
+				si_read_unlock(sb);
+				break;
+			}
+			di_read_unlock(root, !AuLock_IR);
+			si_read_unlock(sb);
+			err = 0;
+			opt->type = token;
+			break;
+
+		case Opt_trunc_xino:
+		case Opt_notrunc_xino:
+		case Opt_noxino:
+		case Opt_trunc_xib:
+		case Opt_notrunc_xib:
+			err = 0;
+			opt->type = token;
+			break;
+
 		case Opt_ignore:
 			pr_warn("ignored %s\n", opt_str);
 			/*FALLTHROUGH*/
@@ -341,6 +499,52 @@ out:
 }
 
 /*
+ * returns,
+ * plus: processed without an error
+ * zero: unprocessed
+ */
+static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
+			 struct au_opts *opts)
+{
+	int err;
+	struct au_sbinfo *sbinfo;
+
+	SiMustWriteLock(sb);
+
+	err = 1; /* handled */
+	sbinfo = au_sbi(sb);
+	switch (opt->type) {
+	case Opt_trunc_xino:
+		au_opt_set(sbinfo->si_mntflags, TRUNC_XINO);
+		break;
+	case Opt_notrunc_xino:
+		au_opt_clr(sbinfo->si_mntflags, TRUNC_XINO);
+		break;
+
+	case Opt_trunc_xino_path:
+	case Opt_itrunc_xino:
+		err = au_xino_trunc(sb, opt->xino_itrunc.bindex,
+				    /*idx_begin*/0);
+		if (!err)
+			err = 1;
+		break;
+
+	case Opt_trunc_xib:
+		au_fset_opts(opts->flags, TRUNC_XIB);
+		break;
+	case Opt_notrunc_xib:
+		au_fclr_opts(opts->flags, TRUNC_XIB);
+		break;
+
+	default:
+		err = 0;
+		break;
+	}
+
+	return err;
+}
+
+/*
  * returns tri-state.
  * plus: processed without an error
  * zero: unprocessed
@@ -361,6 +565,30 @@ static int au_opt_br(struct super_block *sb, struct au_opt *opt,
 		}
 		break;
 	}
+	return err;
+}
+
+static int au_opt_xino(struct super_block *sb, struct au_opt *opt,
+		       struct au_opt_xino **opt_xino,
+		       struct au_opts *opts)
+{
+	int err;
+
+	err = 0;
+	switch (opt->type) {
+	case Opt_xino:
+		err = au_xino_set(sb, &opt->xino);
+		if (unlikely(err))
+			break;
+
+		*opt_xino = &opt->xino;
+		break;
+
+	case Opt_noxino:
+		au_xino_clr(sb);
+		*opt_xino = (void *)-1;
+		break;
+	}
 
 	return err;
 }
@@ -371,23 +599,26 @@ int au_opts_mount(struct super_block *sb, struct au_opts *opts)
 	unsigned int tmp;
 	aufs_bindex_t bbot;
 	struct au_opt *opt;
+	struct au_opt_xino *opt_xino, xino;
 	struct au_sbinfo *sbinfo;
 
 	SiMustWriteLock(sb);
 
 	err = 0;
+	opt_xino = NULL;
 	opt = opts->opt;
 	while (err >= 0 && opt->type != Opt_tail)
-		/* re-commit later */
-		/* err = au_opt_simple(sb, opt++, opts); */
-		err = 0;
+		err = au_opt_simple(sb, opt++, opts);
 	if (err > 0)
 		err = 0;
 	else if (unlikely(err < 0))
 		goto out;
 
+	/* disable xino temporary */
 	sbinfo = au_sbi(sb);
 	tmp = sbinfo->si_mntflags;
+	au_opt_clr(sbinfo->si_mntflags, XINO);
+
 	opt = opts->opt;
 	while (err >= 0 && opt->type != Opt_tail)
 		err = au_opt_br(sb, opt++, opts);
@@ -402,6 +633,29 @@ int au_opts_mount(struct super_block *sb, struct au_opts *opts)
 		pr_err("no branches\n");
 		goto out;
 	}
+
+	if (au_opt_test(tmp, XINO))
+		au_opt_set(sbinfo->si_mntflags, XINO);
+	opt = opts->opt;
+	while (!err && opt->type != Opt_tail)
+		err = au_opt_xino(sb, opt++, &opt_xino, opts);
+	if (unlikely(err))
+		goto out;
+
+	/* restore xino */
+	if (au_opt_test(tmp, XINO) && !opt_xino) {
+		xino.file = au_xino_def(sb);
+		err = PTR_ERR(xino.file);
+		if (IS_ERR(xino.file))
+			goto out;
+
+		err = au_xino_set(sb, &xino);
+		fput(xino.file);
+		if (unlikely(err))
+			goto out;
+	}
+
+	bbot = au_sbbot(sb);
 
 out:
 	return err;

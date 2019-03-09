@@ -42,6 +42,22 @@ struct au_sbinfo {
 	/* include/asm-ia64/siginfo.h defines a macro named si_flags */
 	unsigned int		si_mntflags;
 
+	/* external inode number (bitmap and translation table) */
+	vfs_readf_t		si_xread;
+	vfs_writef_t		si_xwrite;
+	loff_t			si_ximaxent;	/* max entries in a xino */
+
+	struct file		*si_xib;
+	struct mutex		si_xib_mtx; /* protect xib members */
+	unsigned long		*si_xib_buf;
+	unsigned long		si_xib_last_pindex;
+	int			si_xib_next_bit;
+
+	unsigned long		si_xino_jiffy;
+	unsigned long		si_xino_expire;
+	/* reserved for future use */
+	/* unsigned long long	si_xib_limit; */	/* Max xib file size */
+
 	/*
 	 * sysfs and lifetime management.
 	 * this is not a small structure and it may be a waste of memory in case
@@ -49,6 +65,9 @@ struct au_sbinfo {
 	 * but using sysfs is majority.
 	 */
 	struct kobject		si_kobj;
+
+	/* dirty, necessary for unmounting, sysfs and sysrq */
+	struct super_block	*si_sb;
 };
 
 /* ---------------------------------------------------------------------- */
@@ -193,6 +212,12 @@ static inline struct au_branch *au_sbr(struct super_block *sb,
 {
 	SiMustAnyLock(sb);
 	return au_sbi(sb)->si_branch[0 + bindex];
+}
+
+static inline loff_t au_xi_maxent(struct super_block *sb)
+{
+	SiMustAnyLock(sb);
+	return au_sbi(sb)->si_ximaxent;
 }
 
 #endif /* __KERNEL__ */

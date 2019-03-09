@@ -25,6 +25,7 @@ void au_si_free(struct kobject *kobj)
 	au_rw_write_unlock(&sbinfo->si_rwsem);
 
 	au_kfree_try_rcu(sbinfo->si_branch);
+	mutex_destroy(&sbinfo->si_xib_mtx);
 	AuRwDestroy(&sbinfo->si_rwsem);
 
 	au_kfree_rcu(sbinfo);
@@ -45,16 +46,30 @@ int au_si_alloc(struct super_block *sb)
 	if (unlikely(!sbinfo->si_branch))
 		goto out_sbinfo;
 
+	err = sysaufs_si_init(sbinfo);
+	if (unlikely(err))
+		goto out_br;
+
 	au_nwt_init(&sbinfo->si_nowait);
 	au_rw_init_wlock(&sbinfo->si_rwsem);
 
 	sbinfo->si_bbot = -1;
 	sbinfo->si_last_br_id = AUFS_BRANCH_MAX / 2;
 
+	sbinfo->si_mntflags = AuOpt_Def;
+
+	sbinfo->si_xino_jiffy = jiffies;
+	sbinfo->si_xino_expire
+		= msecs_to_jiffies(AUFS_XINO_DEF_SEC * MSEC_PER_SEC);
+	mutex_init(&sbinfo->si_xib_mtx);
+	/* leave si_xib_last_pindex and si_xib_next_bit */
+
 	/* leave other members for sysaufs and si_mnt. */
+	sbinfo->si_sb = sb;
 	sb->s_fs_info = sbinfo;
 	return 0; /* success */
 
+out_br:
 	au_kfree_try_rcu(sbinfo->si_branch);
 out_sbinfo:
 	au_kfree_rcu(sbinfo);
