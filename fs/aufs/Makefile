@@ -17,7 +17,8 @@ aufs-y := module.o sbinfo.o super.o branch.o xino.o sysaufs.o opts.o \
 	dynop.o \
 	finfo.o file.o f_op.o \
 	dir.o vdir.o \
-	iinfo.o inode.o i_op.o i_op_add.o i_op_del.o i_op_ren.o
+	iinfo.o inode.o i_op.o i_op_add.o i_op_del.o i_op_ren.o \
+	ioctl.o
 
 # all are boolean
 aufs-$(CONFIG_PROC_FS) += procfs.o plink.o
@@ -29,5 +30,6 @@ aufs-$(CONFIG_AUFS_EXPORT) += export.o
 aufs-$(CONFIG_AUFS_XATTR) += xattr.o
 aufs-$(CONFIG_FS_POSIX_ACL) += posix_acl.o
 aufs-$(CONFIG_AUFS_DIRREN) += dirren.o
+aufs-$(CONFIG_AUFS_RDU) += rdu.o
 aufs-$(CONFIG_AUFS_DEBUG) += debug.o
 aufs-$(CONFIG_AUFS_MAGIC_SYSRQ) += sysrq.o
