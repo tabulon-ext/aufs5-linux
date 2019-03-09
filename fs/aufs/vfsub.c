@@ -97,6 +97,50 @@ out:
 	return err;
 }
 
+int vfsub_symlink(struct inode *dir, struct path *path, const char *symname)
+{
+	int err;
+	struct dentry *d;
+
+	IMustLock(dir);
+
+	d = path->dentry;
+	path->dentry = d->d_parent;
+	err = security_path_symlink(path, d, symname);
+	path->dentry = d;
+	if (unlikely(err))
+		goto out;
+
+	lockdep_off();
+	err = vfs_symlink(dir, path->dentry, symname);
+	lockdep_on();
+
+out:
+	return err;
+}
+
+int vfsub_mknod(struct inode *dir, struct path *path, int mode, dev_t dev)
+{
+	int err;
+	struct dentry *d;
+
+	IMustLock(dir);
+
+	d = path->dentry;
+	path->dentry = d->d_parent;
+	err = security_path_mknod(path, d, mode, new_encode_dev(dev));
+	path->dentry = d;
+	if (unlikely(err))
+		goto out;
+
+	lockdep_off();
+	err = vfs_mknod(dir, path->dentry, mode, dev);
+	lockdep_on();
+
+out:
+	return err;
+}
+
 static int au_test_nlink(struct inode *inode)
 {
 	const unsigned int link_max = UINT_MAX >> 1; /* rough margin */
@@ -129,6 +173,36 @@ int vfsub_link(struct dentry *src_dentry, struct inode *dir, struct path *path,
 
 	lockdep_off();
 	err = vfs_link(src_dentry, dir, path->dentry, delegated_inode);
+	lockdep_on();
+
+out:
+	return err;
+}
+
+int vfsub_rename(struct inode *src_dir, struct dentry *src_dentry,
+		 struct inode *dir, struct path *path,
+		 struct inode **delegated_inode, unsigned int flags)
+{
+	int err;
+	struct path tmp = {
+		.mnt	= path->mnt
+	};
+	struct dentry *d;
+
+	IMustLock(dir);
+	IMustLock(src_dir);
+
+	d = path->dentry;
+	path->dentry = d->d_parent;
+	tmp.dentry = src_dentry->d_parent;
+	err = security_path_rename(&tmp, src_dentry, path, d, /*flags*/0);
+	path->dentry = d;
+	if (unlikely(err))
+		goto out;
+
+	lockdep_off();
+	err = vfs_rename(src_dir, src_dentry, dir, path->dentry,
+			 delegated_inode, flags);
 	lockdep_on();
 
 out:
@@ -237,6 +311,80 @@ ssize_t vfsub_write_k(struct file *file, void *kbuf, size_t count, loff_t *ppos)
 	set_fs(KERNEL_DS);
 	err = vfsub_write_u(file, buf.u, count, ppos);
 	set_fs(oldfs);
+	return err;
+}
+
+/* ---------------------------------------------------------------------- */
+
+struct au_vfsub_mkdir_args {
+	int *errp;
+	struct inode *dir;
+	struct path *path;
+	int mode;
+};
+
+static void au_call_vfsub_mkdir(void *args)
+{
+	struct au_vfsub_mkdir_args *a = args;
+	*a->errp = vfsub_mkdir(a->dir, a->path, a->mode);
+}
+
+int vfsub_sio_mkdir(struct inode *dir, struct path *path, int mode)
+{
+	int err, do_sio, wkq_err;
+
+	do_sio = au_test_h_perm_sio(dir, MAY_EXEC | MAY_WRITE);
+	if (!do_sio) {
+		lockdep_off();
+		err = vfsub_mkdir(dir, path, mode);
+		lockdep_on();
+	} else {
+		struct au_vfsub_mkdir_args args = {
+			.errp	= &err,
+			.dir	= dir,
+			.path	= path,
+			.mode	= mode
+		};
+		wkq_err = au_wkq_wait(au_call_vfsub_mkdir, &args);
+		if (unlikely(wkq_err))
+			err = wkq_err;
+	}
+
+	return err;
+}
+
+struct au_vfsub_rmdir_args {
+	int *errp;
+	struct inode *dir;
+	struct path *path;
+};
+
+static void au_call_vfsub_rmdir(void *args)
+{
+	struct au_vfsub_rmdir_args *a = args;
+	*a->errp = vfsub_rmdir(a->dir, a->path);
+}
+
+int vfsub_sio_rmdir(struct inode *dir, struct path *path)
+{
+	int err, do_sio, wkq_err;
+
+	do_sio = au_test_h_perm_sio(dir, MAY_EXEC | MAY_WRITE);
+	if (!do_sio) {
+		lockdep_off();
+		err = vfsub_rmdir(dir, path);
+		lockdep_on();
+	} else {
+		struct au_vfsub_rmdir_args args = {
+			.errp	= &err,
+			.dir	= dir,
+			.path	= path
+		};
+		wkq_err = au_wkq_wait(au_call_vfsub_rmdir, &args);
+		if (unlikely(wkq_err))
+			err = wkq_err;
+	}
+
 	return err;
 }
 

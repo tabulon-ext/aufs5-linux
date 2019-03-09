@@ -22,6 +22,8 @@ enum {
 	Opt_trunc_xino_path, Opt_itrunc_xino,
 	Opt_trunc_xib, Opt_notrunc_xib,
 	Opt_plink, Opt_noplink, Opt_list_plink,
+	Opt_dio, Opt_nodio,
+	Opt_wbr_copyup, Opt_wbr_create,
 	Opt_tail, Opt_ignore, Opt_ignore_silent, Opt_err
 };
 
@@ -52,6 +54,15 @@ static match_table_t options = {
 	{Opt_list_plink, "list_plink"},
 #endif
 
+	{Opt_dio, "dio"},
+	{Opt_nodio, "nodio"},
+
+	{Opt_wbr_create, "create=%s"},
+	{Opt_wbr_create, "create_policy=%s"},
+	{Opt_wbr_copyup, "cpup=%s"},
+	{Opt_wbr_copyup, "copyup=%s"},
+	{Opt_wbr_copyup, "copyup_policy=%s"},
+
 	/* internal use for the scripts */
 	{Opt_ignore_silent, "si=%s"},
 
@@ -62,6 +73,20 @@ static match_table_t options = {
 };
 
 /* ---------------------------------------------------------------------- */
+
+static const char *au_parser_pattern(int val, match_table_t tbl)
+{
+	struct match_token *p;
+
+	p = tbl;
+	while (p->pattern) {
+		if (p->token == val)
+			return p->pattern;
+		p++;
+	}
+	BUG();
+	return "??";
+}
 
 static const char *au_optstr(int *val, match_table_t tbl)
 {
@@ -231,6 +256,155 @@ void au_optstr_br_perm(au_br_perm_str_t *str, int perm)
 
 /* ---------------------------------------------------------------------- */
 
+static match_table_t udbalevel = {
+	{AuOpt_UDBA_REVAL, "reval"},
+	{AuOpt_UDBA_NONE, "none"},
+	{-1, NULL}
+};
+
+/* re-commit later */ __maybe_unused
+static int noinline_for_stack udba_val(char *str)
+{
+	substring_t args[MAX_OPT_ARGS];
+
+	return match_token(str, udbalevel, args);
+}
+
+const char *au_optstr_udba(int udba)
+{
+	return au_parser_pattern(udba, udbalevel);
+}
+
+/* ---------------------------------------------------------------------- */
+
+static match_table_t au_wbr_create_policy = {
+	{AuWbrCreate_TDP, "tdp"},
+	{AuWbrCreate_TDP, "top-down-parent"},
+	{AuWbrCreate_RR, "rr"},
+	{AuWbrCreate_RR, "round-robin"},
+	{AuWbrCreate_MFS, "mfs"},
+	{AuWbrCreate_MFS, "most-free-space"},
+	{AuWbrCreate_MFSV, "mfs:%d"},
+	{AuWbrCreate_MFSV, "most-free-space:%d"},
+
+	/* top-down regardless the parent, and then mfs */
+	{AuWbrCreate_TDMFS, "tdmfs:%d"},
+	{AuWbrCreate_TDMFSV, "tdmfs:%d:%d"},
+
+	{AuWbrCreate_MFSRR, "mfsrr:%d"},
+	{AuWbrCreate_MFSRRV, "mfsrr:%d:%d"},
+	{AuWbrCreate_PMFS, "pmfs"},
+	{AuWbrCreate_PMFSV, "pmfs:%d"},
+	{AuWbrCreate_PMFSRR, "pmfsrr:%d"},
+	{AuWbrCreate_PMFSRRV, "pmfsrr:%d:%d"},
+
+	{-1, NULL}
+};
+
+static int au_wbr_mfs_wmark(substring_t *arg, char *str,
+			    struct au_opt_wbr_create *create)
+{
+	int err;
+	unsigned long long ull;
+
+	err = 0;
+	if (!match_u64(arg, &ull))
+		create->mfsrr_watermark = ull;
+	else {
+		pr_err("bad integer in %s\n", str);
+		err = -EINVAL;
+	}
+
+	return err;
+}
+
+static int au_wbr_mfs_sec(substring_t *arg, char *str,
+			  struct au_opt_wbr_create *create)
+{
+	int n, err;
+
+	err = 0;
+	if (!match_int(arg, &n) && 0 <= n && n <= AUFS_MFS_MAX_SEC)
+		create->mfs_second = n;
+	else {
+		pr_err("bad integer in %s\n", str);
+		err = -EINVAL;
+	}
+
+	return err;
+}
+
+static int noinline_for_stack
+au_wbr_create_val(char *str, struct au_opt_wbr_create *create)
+{
+	int err, e;
+	substring_t args[MAX_OPT_ARGS];
+
+	err = match_token(str, au_wbr_create_policy, args);
+	create->wbr_create = err;
+	switch (err) {
+	case AuWbrCreate_MFSRRV:
+	case AuWbrCreate_TDMFSV:
+	case AuWbrCreate_PMFSRRV:
+		e = au_wbr_mfs_wmark(&args[0], str, create);
+		if (!e)
+			e = au_wbr_mfs_sec(&args[1], str, create);
+		if (unlikely(e))
+			err = e;
+		break;
+	case AuWbrCreate_MFSRR:
+	case AuWbrCreate_TDMFS:
+	case AuWbrCreate_PMFSRR:
+		e = au_wbr_mfs_wmark(&args[0], str, create);
+		if (unlikely(e)) {
+			err = e;
+			break;
+		}
+		/*FALLTHROUGH*/
+	case AuWbrCreate_MFS:
+	case AuWbrCreate_PMFS:
+		create->mfs_second = AUFS_MFS_DEF_SEC;
+		break;
+	case AuWbrCreate_MFSV:
+	case AuWbrCreate_PMFSV:
+		e = au_wbr_mfs_sec(&args[0], str, create);
+		if (unlikely(e))
+			err = e;
+		break;
+	}
+
+	return err;
+}
+
+const char *au_optstr_wbr_create(int wbr_create)
+{
+	return au_parser_pattern(wbr_create, au_wbr_create_policy);
+}
+
+static match_table_t au_wbr_copyup_policy = {
+	{AuWbrCopyup_TDP, "tdp"},
+	{AuWbrCopyup_TDP, "top-down-parent"},
+	{AuWbrCopyup_BUP, "bup"},
+	{AuWbrCopyup_BUP, "bottom-up-parent"},
+	{AuWbrCopyup_BU, "bu"},
+	{AuWbrCopyup_BU, "bottom-up"},
+	{-1, NULL}
+};
+
+static int noinline_for_stack au_wbr_copyup_val(char *str)
+{
+	substring_t args[MAX_OPT_ARGS];
+
+	return match_token(str, au_wbr_copyup_policy, args);
+}
+
+const char *au_optstr_wbr_copyup(int wbr_copyup)
+{
+	return au_parser_pattern(wbr_copyup, au_wbr_copyup_policy);
+}
+
+/* ---------------------------------------------------------------------- */
+
 static const int lkup_dirflags = LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
 
 static void dump_opts(struct au_opts *opts)
@@ -241,6 +415,7 @@ static void dump_opts(struct au_opts *opts)
 		struct au_opt_add *add;
 		struct au_opt_xino *xino;
 		struct au_opt_xino_itrunc *xino_itrunc;
+		struct au_opt_wbr_create *create;
 	} u;
 	struct au_opt *opt;
 
@@ -285,6 +460,39 @@ static void dump_opts(struct au_opts *opts)
 			break;
 		case Opt_list_plink:
 			AuLabel(list_plink);
+			break;
+		case Opt_dio:
+			AuLabel(dio);
+			break;
+		case Opt_nodio:
+			AuLabel(nodio);
+			break;
+		case Opt_wbr_create:
+			u.create = &opt->wbr_create;
+			AuDbg("create %d, %s\n", u.create->wbr_create,
+				  au_optstr_wbr_create(u.create->wbr_create));
+			switch (u.create->wbr_create) {
+			case AuWbrCreate_MFSV:
+			case AuWbrCreate_PMFSV:
+				AuDbg("%d sec\n", u.create->mfs_second);
+				break;
+			case AuWbrCreate_MFSRR:
+			case AuWbrCreate_TDMFS:
+				AuDbg("%llu watermark\n",
+					  u.create->mfsrr_watermark);
+				break;
+			case AuWbrCreate_MFSRRV:
+			case AuWbrCreate_TDMFSV:
+			case AuWbrCreate_PMFSRRV:
+				AuDbg("%llu watermark, %d sec\n",
+					  u.create->mfsrr_watermark,
+					  u.create->mfs_second);
+				break;
+			}
+			break;
+		case Opt_wbr_copyup:
+			AuDbg("copyup %d, %s\n", opt->wbr_copyup,
+				  au_optstr_wbr_copyup(opt->wbr_copyup));
 			break;
 		default:
 			BUG();
@@ -516,8 +724,29 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 		case Opt_plink:
 		case Opt_noplink:
 		case Opt_list_plink:
+		case Opt_dio:
+		case Opt_nodio:
 			err = 0;
 			opt->type = token;
+			break;
+
+		case Opt_wbr_create:
+			u.create = &opt->wbr_create;
+			u.create->wbr_create
+				= au_wbr_create_val(a->args[0].from, u.create);
+			if (u.create->wbr_create >= 0) {
+				err = 0;
+				opt->type = token;
+			} else
+				pr_err("wrong value, %s\n", opt_str);
+			break;
+		case Opt_wbr_copyup:
+			opt->wbr_copyup = au_wbr_copyup_val(a->args[0].from);
+			if (opt->wbr_copyup >= 0) {
+				err = 0;
+				opt->type = token;
+			} else
+				pr_err("wrong value, %s\n", opt_str);
 			break;
 
 		case Opt_ignore:
@@ -552,6 +781,48 @@ out:
 	return err;
 }
 
+static int au_opt_wbr_create(struct super_block *sb,
+			     struct au_opt_wbr_create *create)
+{
+	int err;
+	struct au_sbinfo *sbinfo;
+
+	SiMustWriteLock(sb);
+
+	err = 1; /* handled */
+	sbinfo = au_sbi(sb);
+	if (sbinfo->si_wbr_create_ops->fin) {
+		err = sbinfo->si_wbr_create_ops->fin(sb);
+		if (!err)
+			err = 1;
+	}
+
+	sbinfo->si_wbr_create = create->wbr_create;
+	sbinfo->si_wbr_create_ops = au_wbr_create_ops + create->wbr_create;
+	switch (create->wbr_create) {
+	case AuWbrCreate_MFSRRV:
+	case AuWbrCreate_MFSRR:
+	case AuWbrCreate_TDMFS:
+	case AuWbrCreate_TDMFSV:
+	case AuWbrCreate_PMFSRR:
+	case AuWbrCreate_PMFSRRV:
+		sbinfo->si_wbr_mfs.mfsrr_watermark = create->mfsrr_watermark;
+		/*FALLTHROUGH*/
+	case AuWbrCreate_MFS:
+	case AuWbrCreate_MFSV:
+	case AuWbrCreate_PMFS:
+	case AuWbrCreate_PMFSV:
+		sbinfo->si_wbr_mfs.mfs_expire
+			= msecs_to_jiffies(create->mfs_second * MSEC_PER_SEC);
+		break;
+	}
+
+	if (sbinfo->si_wbr_create_ops->init)
+		sbinfo->si_wbr_create_ops->init(sb); /* ignore */
+
+	return err;
+}
+
 /*
  * returns,
  * plus: processed without an error
@@ -579,6 +850,23 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 	case Opt_list_plink:
 		if (au_opt_test(sbinfo->si_mntflags, PLINK))
 			au_plink_list(sb);
+		break;
+
+	case Opt_dio:
+		au_opt_set(sbinfo->si_mntflags, DIO);
+		au_fset_opts(opts->flags, REFRESH_DYAOP);
+		break;
+	case Opt_nodio:
+		au_opt_clr(sbinfo->si_mntflags, DIO);
+		au_fset_opts(opts->flags, REFRESH_DYAOP);
+		break;
+
+	case Opt_wbr_create:
+		err = au_opt_wbr_create(sb, &opt->wbr_create);
+		break;
+	case Opt_wbr_copyup:
+		sbinfo->si_wbr_copyup = opt->wbr_copyup;
+		sbinfo->si_wbr_copyup_ops = au_wbr_copyup_ops + opt->wbr_copyup;
 		break;
 
 	case Opt_trunc_xino:
@@ -816,4 +1104,11 @@ int au_opts_mount(struct super_block *sb, struct au_opts *opts)
 
 out:
 	return err;
+}
+
+/* ---------------------------------------------------------------------- */
+
+unsigned int au_opt_udba(struct super_block *sb)
+{
+	return au_mntflags(sb) & AuOptMask_UDBA;
 }
