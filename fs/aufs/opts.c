@@ -22,6 +22,7 @@ enum {
 	Opt_trunc_xino_path, Opt_itrunc_xino,
 	Opt_trunc_xib, Opt_notrunc_xib,
 	Opt_plink, Opt_noplink, Opt_list_plink,
+	Opt_udba,
 	Opt_dio, Opt_nodio,
 	Opt_wbr_copyup, Opt_wbr_create,
 	Opt_tail, Opt_ignore, Opt_ignore_silent, Opt_err
@@ -53,6 +54,8 @@ static match_table_t options = {
 #ifdef CONFIG_AUFS_DEBUG
 	{Opt_list_plink, "list_plink"},
 #endif
+
+	{Opt_udba, "udba=%s"},
 
 	{Opt_dio, "dio"},
 	{Opt_nodio, "nodio"},
@@ -259,10 +262,15 @@ void au_optstr_br_perm(au_br_perm_str_t *str, int perm)
 static match_table_t udbalevel = {
 	{AuOpt_UDBA_REVAL, "reval"},
 	{AuOpt_UDBA_NONE, "none"},
+#ifdef CONFIG_AUFS_HNOTIFY
+	{AuOpt_UDBA_HNOTIFY, "notify"}, /* abstraction */
+#ifdef CONFIG_AUFS_HFSNOTIFY
+	{AuOpt_UDBA_HNOTIFY, "fsnotify"},
+#endif
+#endif
 	{-1, NULL}
 };
 
-/* re-commit later */ __maybe_unused
 static int noinline_for_stack udba_val(char *str)
 {
 	substring_t args[MAX_OPT_ARGS];
@@ -461,6 +469,10 @@ static void dump_opts(struct au_opts *opts)
 		case Opt_list_plink:
 			AuLabel(list_plink);
 			break;
+		case Opt_udba:
+			AuDbg("udba %d, %s\n",
+				  opt->udba, au_optstr_udba(opt->udba));
+			break;
 		case Opt_dio:
 			AuLabel(dio);
 			break;
@@ -600,8 +612,7 @@ au_opts_parse_xino_itrunc_path(struct super_block *sb,
 
 	xino_itrunc->bindex = -1;
 	root = sb->s_root;
-	si_read_lock(sb, AuLock_FLUSH);
-	di_read_lock_child(root, /*flags*/0);
+	aufs_read_lock(root, AuLock_FLUSH);
 	bbot = au_sbbot(sb);
 	for (bindex = 0; bindex <= bbot; bindex++) {
 		if (au_h_dptr(root, bindex) == path.dentry) {
@@ -609,8 +620,7 @@ au_opts_parse_xino_itrunc_path(struct super_block *sb,
 			break;
 		}
 	}
-	di_read_unlock(root, /*flags*/0);
-	si_read_unlock(sb);
+	aufs_read_unlock(root, !AuLock_IR);
 	path_put(&path);
 
 	if (unlikely(xino_itrunc->bindex < 0)) {
@@ -702,16 +712,13 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 				break;
 			}
 			u.xino_itrunc->bindex = n;
-			si_read_lock(sb, AuLock_FLUSH);
-			di_read_lock_child(root, !AuLock_IR);
+			aufs_read_lock(root, AuLock_FLUSH);
 			if (n < 0 || au_sbbot(sb) < n) {
 				pr_err("out of bounds, %d\n", n);
-				di_read_unlock(root, !AuLock_IR);
-				si_read_unlock(sb);
+				aufs_read_unlock(root, !AuLock_IR);
 				break;
 			}
-			di_read_unlock(root, !AuLock_IR);
-			si_read_unlock(sb);
+			aufs_read_unlock(root, !AuLock_IR);
 			err = 0;
 			opt->type = token;
 			break;
@@ -728,6 +735,15 @@ int au_opts_parse(struct super_block *sb, char *str, struct au_opts *opts)
 		case Opt_nodio:
 			err = 0;
 			opt->type = token;
+			break;
+
+		case Opt_udba:
+			opt->udba = udba_val(a->args[0].from);
+			if (opt->udba >= 0) {
+				err = 0;
+				opt->type = token;
+			} else
+				pr_err("wrong value, %s\n", opt_str);
 			break;
 
 		case Opt_wbr_create:
@@ -839,6 +855,12 @@ static int au_opt_simple(struct super_block *sb, struct au_opt *opt,
 	err = 1; /* handled */
 	sbinfo = au_sbi(sb);
 	switch (opt->type) {
+	case Opt_udba:
+		sbinfo->si_mntflags &= ~AuOptMask_UDBA;
+		sbinfo->si_mntflags |= opt->udba;
+		opts->given_udba |= opt->udba;
+		break;
+
 	case Opt_plink:
 		au_opt_set(sbinfo->si_mntflags, PLINK);
 		break;
@@ -964,6 +986,7 @@ int au_opts_verify(struct super_block *sb, unsigned long sb_flags,
 	SiMustAnyLock(sb);
 
 	sbinfo = au_sbi(sb);
+	AuDebugOn(!(sbinfo->si_mntflags & AuOptMask_UDBA));
 
 	if (!(sb_flags & SB_RDONLY)) {
 		if (unlikely(!au_br_writable(au_sbr_perm(sb, 0))))
@@ -1017,13 +1040,13 @@ int au_opts_verify(struct super_block *sb, unsigned long sb_flags,
 			continue;
 
 		hdir = au_hi(dir, bindex);
-		inode_lock_nested(hdir->hi_inode, AuLsc_I_PARENT);
+		au_hn_inode_lock_nested(hdir, AuLsc_I_PARENT);
 		if (wbr)
 			wbr_wh_write_lock(wbr);
 		err = au_wh_init(br, sb);
 		if (wbr)
 			wbr_wh_write_unlock(wbr);
-		inode_unlock(hdir->hi_inode);
+		au_hn_inode_unlock(hdir);
 
 		if (!err && do_free) {
 			au_kfree_rcu(wbr);
@@ -1038,10 +1061,12 @@ int au_opts_mount(struct super_block *sb, struct au_opts *opts)
 {
 	int err;
 	unsigned int tmp;
-	aufs_bindex_t bbot;
+	aufs_bindex_t bindex, bbot;
 	struct au_opt *opt;
 	struct au_opt_xino *opt_xino, xino;
 	struct au_sbinfo *sbinfo;
+	struct au_branch *br;
+	struct inode *dir;
 
 	SiMustWriteLock(sb);
 
@@ -1055,10 +1080,11 @@ int au_opts_mount(struct super_block *sb, struct au_opts *opts)
 	else if (unlikely(err < 0))
 		goto out;
 
-	/* disable xino temporary */
+	/* disable xino and udba temporary */
 	sbinfo = au_sbi(sb);
 	tmp = sbinfo->si_mntflags;
 	au_opt_clr(sbinfo->si_mntflags, XINO);
+	au_opt_set_udba(sbinfo->si_mntflags, UDBA_REVAL);
 
 	opt = opts->opt;
 	while (err >= 0 && opt->type != Opt_tail)
@@ -1100,7 +1126,23 @@ int au_opts_mount(struct super_block *sb, struct au_opts *opts)
 			goto out;
 	}
 
+	/* restore udba */
+	tmp &= AuOptMask_UDBA;
+	sbinfo->si_mntflags &= ~AuOptMask_UDBA;
+	sbinfo->si_mntflags |= tmp;
 	bbot = au_sbbot(sb);
+	for (bindex = 0; bindex <= bbot; bindex++) {
+		br = au_sbr(sb, bindex);
+		err = au_hnotify_reset_br(tmp, br, br->br_perm);
+		if (unlikely(err))
+			AuIOErr("hnotify failed on br %d, %d, ignored\n",
+				bindex, err);
+		/* go on even if err */
+	}
+	if (au_opt_test(tmp, UDBA_HNOTIFY)) {
+		dir = d_inode(sb->s_root);
+		au_hn_reset(dir, au_hi_flags(dir, /*isdir*/1) & ~AuHi_XINO);
+	}
 
 out:
 	return err;
