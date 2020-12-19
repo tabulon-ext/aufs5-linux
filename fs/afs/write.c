@@ -449,6 +449,7 @@ static int afs_store_data(struct address_space *mapping,
 	op->store.first_offset = offset;
 	op->store.last_to = to;
 	op->mtime = vnode->vfs_inode.i_mtime;
+	op->flags |= AFS_OPERATION_UNINTR;
 	op->ops = &afs_store_data_operation;
 
 try_next_key:
@@ -608,7 +609,7 @@ no_more:
 
 	default:
 		pr_notice("kAFS: Unexpected error from FS.StoreData %d\n", ret);
-		/* Fall through */
+		fallthrough;
 	case -EACCES:
 	case -EPERM:
 	case -ENOKEY:
@@ -737,10 +738,20 @@ static int afs_writepages_region(struct address_space *mapping,
 int afs_writepages(struct address_space *mapping,
 		   struct writeback_control *wbc)
 {
+	struct afs_vnode *vnode = AFS_FS_I(mapping->host);
 	pgoff_t start, end, next;
 	int ret;
 
 	_enter("");
+
+	/* We have to be careful as we can end up racing with setattr()
+	 * truncating the pagecache since the caller doesn't take a lock here
+	 * to prevent it.
+	 */
+	if (wbc->sync_mode == WB_SYNC_ALL)
+		down_read(&vnode->validate_lock);
+	else if (!down_read_trylock(&vnode->validate_lock))
+		return 0;
 
 	if (wbc->range_cyclic) {
 		start = mapping->writeback_index;
@@ -761,6 +772,7 @@ int afs_writepages(struct address_space *mapping,
 		ret = afs_writepages_region(mapping, wbc, start, end, &next);
 	}
 
+	up_read(&vnode->validate_lock);
 	_leave(" = %d", ret);
 	return ret;
 }
